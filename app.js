@@ -11,7 +11,7 @@
     document.querySelectorAll('[data-relay]').forEach(btn => btn.onclick = () => publish(topic(`relay/${btn.dataset.relay}/set`), btn.classList.contains('on') ? 'OFF' : 'ON'));
   }
   function setRelay(relay, on) { const btn = document.querySelector(`[data-relay="${relay}"]`); if (!btn) return; btn.className = on ? 'on' : 'off'; btn.textContent = on ? 'เปิดอยู่' : 'ปิด'; }
-  function publish(t, payload) { if (!client?.connected) return log('ยังไม่ได้เชื่อมต่อ MQTT'); client.publish(t, payload, {qos: 1, retain: false}); log(`ส่ง ${payload} → ${t}`); }
+  function publish(t, payload) { if (window.FIREBASE_AUTH_ENABLED && !window.SmartFarmAccess?.can("operator")) return log("ไม่มีสิทธิ์ควบคุมรีเลย์"); if (!client?.connected) return log('ยังไม่ได้เชื่อมต่อ MQTT'); client.publish(t, payload, {qos: 1, retain: false}); log(`ส่ง ${payload} → ${t}`); }
   function connect() {
     const user = $('mqttUser').value.trim(), pass = $('mqttPass').value;
     if (!user || !pass) return log('กรุณากรอก MQTT username และ password');

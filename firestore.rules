@@ -1,0 +1,17 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function role() { return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role : 'viewer'; }
+    function canManage() { return role() in ['owner', 'admin']; }
+    function canControl() { return role() in ['owner', 'admin', 'operator']; }
+    match /users/{uid} {
+      allow read: if canManage() || (signedIn() && request.auth.uid == uid);
+      allow create: if signedIn() && request.auth.uid == uid;
+      allow update: if canManage();
+      allow delete: if role() == 'owner';
+    }
+    match /farms/{farmId} { allow read: if signedIn(); allow write: if canManage(); }
+    match /auditLogs/{logId} { allow create: if canControl(); allow read: if canManage(); }
+  }
+}
