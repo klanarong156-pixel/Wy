@@ -7,7 +7,7 @@
   const topic = path => `${cfg.base}/${path}`;
   const log = text => { $('log').textContent = `${new Date().toLocaleTimeString('th-TH')}  ${text}`; };
   function renderRelays() {
-    $('relays').innerHTML = cfg.relays.map((relay, i) => `<article class="relay"><div><b>รีเลย์ ${i + 1}</b><input data-name="${relay}" value="${names[relay] || relay}" maxlength="40"><small>MQTT: ${relay}</small></div><div class="tap-actions"><button data-relay-on="${relay}" class="tap-on">เปิด</button><button data-relay-off="${relay}" class="tap-off">ปิด</button></div></article>`).join('');
+    $('relays').innerHTML = cfg.relays.map((relay, i) => `<article class="relay relay-${relay}"><div><b>รีเลย์ ${i + 1}</b><input data-name="${relay}" value="${names[relay] || relay}" maxlength="40"><small>MQTT: ${relay}</small></div><div class="tap-actions"><button data-relay-on="${relay}" class="tap-on">เปิด</button><button data-relay-off="${relay}" class="tap-off">ปิด</button></div></article>`).join('');
     document.querySelectorAll('[data-relay-on]').forEach(btn => btn.onclick = () => publish(topic(`relay/${btn.dataset.relayOn}/set`), 'ON')); document.querySelectorAll('[data-relay-off]').forEach(btn => btn.onclick = () => publish(topic(`relay/${btn.dataset.relayOff}/set`), 'OFF'));
   }
   function setRelay(relay, on) { const onBtn = document.querySelector(`[data-relay-on="${relay}"]`), offBtn = document.querySelector(`[data-relay-off="${relay}"]`); if (!onBtn || !offBtn) return; onBtn.classList.toggle('selected', on); offBtn.classList.toggle('selected', !on); const active = document.querySelectorAll('[data-relay-on].selected').length; if ($('activeCount')) $('activeCount').textContent = `${active} / ${cfg.relays.length}`; }
