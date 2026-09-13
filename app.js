@@ -28,6 +28,6 @@
     });
   }
   $('connectBtn').onclick = connect;
-  $('saveNames').onclick = () => { document.querySelectorAll('[data-name]').forEach(input => { names[input.dataset.name] = input.value.trim() || cfg.defaults[input.dataset.name]; }); localStorage.setItem(namesKey, JSON.stringify(names)); log('บันทึกชื่อรีเลย์แล้ว'); };
+  if ($('saveNames')) $('saveNames').onclick = () => { document.querySelectorAll('[data-name]').forEach(input => { names[input.dataset.name] = input.value.trim() || cfg.defaults[input.dataset.name]; }); localStorage.setItem(namesKey, JSON.stringify(names)); log('บันทึกชื่อรีเลย์แล้ว'); };
   renderRelays();
 })();
