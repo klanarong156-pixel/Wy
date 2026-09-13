@@ -29,5 +29,12 @@
   }
   $('connectBtn').onclick = connect;
   if ($('saveNames')) $('saveNames').onclick = () => { document.querySelectorAll('[data-name]').forEach(input => { names[input.dataset.name] = input.value.trim() || cfg.defaults[input.dataset.name]; }); localStorage.setItem(namesKey, JSON.stringify(names)); log('บันทึกชื่อรีเลย์แล้ว'); };
-  renderRelays();
+  function mode(mode) { publish(topic('mode/set'), mode); if ($('modeStatus')) $('modeStatus').textContent = `โหมดปัจจุบัน: ${mode}`; }
+  document.querySelectorAll('[data-mode]').forEach(button => button.onclick = () => mode(button.dataset.mode));
+  const threshold = $('soilThreshold'), duration = $('wateringDuration'), thresholdValue = $('soilThresholdValue'), durationValue = $('wateringDurationValue');
+  function updateWateringLabels() { if (thresholdValue) thresholdValue.textContent = `${threshold.value}%`; if (durationValue) durationValue.textContent = `${duration.value} นาที`; }
+  threshold?.addEventListener('input', updateWateringLabels); duration?.addEventListener('input', updateWateringLabels);
+  $('wateringEnabled')?.addEventListener('change', () => { $('wateringState').textContent = $('wateringEnabled').checked ? 'เปิดระบบอัตโนมัติ' : 'ปิดระบบอัตโนมัติ'; });
+  $('saveWatering')?.addEventListener('click', () => { const enabled = $('wateringEnabled').checked; publish(topic('automation/watering/set'), JSON.stringify({ enabled, soilThreshold: Number(threshold.value), durationMinutes: Number(duration.value), relay: 'pump' })); if ($('wateringState')) $('wateringState').textContent = enabled ? 'บันทึกแล้ว · รอความชื้นดินต่ำกว่าเกณฑ์' : 'บันทึกแล้ว · ปิดระบบอัตโนมัติ'; });
+  updateWateringLabels(); renderRelays();
 })();
