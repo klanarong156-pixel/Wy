@@ -11,5 +11,5 @@
   function can(minRole = 'viewer') { return Boolean(state.user && roles[state.role] >= roles[minRole]); }
   function requireAuth(target = 'auth.html') { if (configured() && !state.user) location.href = target; }
   window.SmartFarmAccess = { state, configured, start, can, requireAuth, signOut: () => firebase.auth().signOut() };
-  start();
+  window.SmartFarmAccess.ready = start();
 })();
