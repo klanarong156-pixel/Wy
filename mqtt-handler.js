@@ -1,0 +1,602 @@
+class MqttHandler {
+  constructor(config) {
+    this.config = config;
+    this.client = null;
+    this.connecting = false;
+    this.bootstrapped = false;
+    this.deviceTimer = null;
+    this.pendingPublishes = [];
+    this.publishSequence = 0;
+    this.lastConnectError = '';
+    this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
+    this.reconnectBaseMs = 1000;
+    this.reconnectMaxMs = 30000;
+    this.reconnectJitterMs = 700;
+    this.worker = null;
+    this.usingSharedWorker = false;
+    this.storageUser = 'smartfarm.mqtt.username';
+    this.storagePass = 'smartfarm.mqtt.password';
+    this.storageRemember = 'smartfarm.mqtt.remember';
+  }
+
+  dispatch(name, detail) {
+    window.dispatchEvent(new CustomEvent(name, { detail }));
+  }
+
+  nextPublishId() {
+    this.publishSequence += 1;
+    return `${Date.now()}-${this.publishSequence}`;
+  }
+
+  errorMessage(error, fallback = 'MQTT publish failed') {
+    return String(error?.message || error?.reason || error || fallback);
+  }
+
+  isImportantCommand(topic) {
+    return /^(?:smartfarm\/relay\/[^/]+\/(?:set|timer\/set)|smartfarm\/schedule\/[^/]+\/set|smartfarm\/(?:emergency|mode)\/set|smartfarm\/config\/telegram\/(?:set|test)|smartfarm\/reminder\/set|smartfarm\/ai\/alert\/set)$/.test(String(topic || ''));
+  }
+
+  publishOptions(topic, options = {}) {
+    const important = this.isImportantCommand(topic);
+    return {
+      ...options,
+      qos: important ? 1 : Math.max(0, Math.min(2, Number(options.qos) || 0)),
+      retain: important ? false : Boolean(options.retain)
+    };
+  }
+
+  dispatchCommandStatus(state, detail = {}) {
+    this.dispatch('mqtt:command-status', {
+      state,
+      important: this.isImportantCommand(detail.topic),
+      ...detail
+    });
+  }
+
+  clearReconnectTimer(resetAttempt = false) {
+    if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    if (resetAttempt) this.reconnectAttempt = 0;
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectTimer || !this.hasCredentials()) return;
+    const exponential = Math.min(this.reconnectMaxMs, this.reconnectBaseMs * (2 ** Math.min(this.reconnectAttempt, 5)));
+    const jitter = Math.floor(Math.random() * this.reconnectJitterMs);
+    const delay = exponential + jitter;
+    const attempt = this.reconnectAttempt + 1;
+    this.reconnectAttempt = attempt;
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!APP_STATE.mqttConnected && this.hasCredentials()) this.connect(false);
+    }, delay);
+    this.dispatch('mqtt:reconnecting', { delay, attempt });
+  }
+
+  publishDirect(topic, payload, options, requestId) {
+    if (!this.client?.connected) {
+      this.dispatch('mqtt:publish-error', { requestId, topic, error: new Error('MQTT ยังไม่เชื่อมต่อ') });
+      return false;
+    }
+    try {
+      this.client.publish(topic, payload, options, (error, packet) => {
+        if (error) {
+          this.dispatchCommandStatus('error', { requestId, topic, error: this.errorMessage(error) });
+          this.dispatch('mqtt:publish-error', {
+            requestId,
+            topic,
+            error: new Error(this.errorMessage(error)),
+            packet
+          });
+          return;
+        }
+        this.dispatchCommandStatus('acknowledged', { requestId, topic, qos: packet?.qos ?? options?.qos ?? 0 });
+        this.dispatch('mqtt:publish-ack', { requestId, topic, packet });
+      });
+      return true;
+    } catch (error) {
+      this.dispatchCommandStatus('error', { requestId, topic, error: this.errorMessage(error) });
+      this.dispatch('mqtt:publish-error', { requestId, topic, error });
+      return false;
+    }
+  }
+
+  getCredentials() {
+    const configuredUser = String(this.config?.username || '').trim();
+    const configuredPass = String(this.config?.password || '');
+    if (configuredUser && configuredPass) return { username: configuredUser, password: configuredPass, remember: false };
+    try {
+      const remembered = localStorage.getItem(this.storageRemember) === 'true';
+      const store = remembered ? localStorage : sessionStorage;
+      return {
+        username: store.getItem(this.storageUser) || this.config?.defaultUsername || '',
+        password: store.getItem(this.storagePass) || '',
+        remember: remembered
+      };
+    } catch (_) {
+      return { username: '', password: '', remember: false };
+    }
+  }
+
+  getCredentialStatus() {
+    const configuredUser = String(this.config?.username || '').trim();
+    const configuredPass = String(this.config?.password || '');
+    if (configuredUser || configuredPass) {
+      return {
+        complete: Boolean(configuredUser && configuredPass),
+        usernamePresent: Boolean(configuredUser),
+        passwordPresent: Boolean(configuredPass),
+        storage: 'config',
+        remember: false,
+        missing: [
+          ...(configuredUser ? [] : ['username']),
+          ...(configuredPass ? [] : ['password'])
+        ]
+      };
+    }
+    try {
+      const remember = localStorage.getItem(this.storageRemember) === 'true';
+      const storage = remember ? localStorage : sessionStorage;
+      const usernamePresent = Boolean(String(storage.getItem(this.storageUser) || this.config?.defaultUsername || '').trim());
+      const passwordPresent = Boolean(storage.getItem(this.storagePass));
+      return {
+        complete: usernamePresent && passwordPresent,
+        usernamePresent,
+        passwordPresent,
+        storage: remember ? 'localStorage' : 'sessionStorage',
+        remember,
+        missing: [
+          ...(usernamePresent ? [] : ['username']),
+          ...(passwordPresent ? [] : ['password'])
+        ]
+      };
+    } catch (error) {
+      return {
+        complete: false,
+        usernamePresent: false,
+        passwordPresent: false,
+        storage: 'unavailable',
+        remember: false,
+        missing: ['username', 'password'],
+        error: this.errorMessage(error, 'ไม่สามารถอ่าน Browser Storage ได้')
+      };
+    }
+  }
+
+  hasCredentials() {
+    return this.getCredentialStatus().complete;
+  }
+
+  setCredentials(username, password, remember = false) {
+    const cleanUser = String(username || '').trim();
+    const cleanPass = String(password || '');
+    if (!cleanUser || !cleanPass) throw new Error('กรุณากรอก MQTT username และ password ให้ครบ');
+    this.clearCredentials(false);
+    const store = remember ? localStorage : sessionStorage;
+    store.setItem(this.storageUser, cleanUser);
+    store.setItem(this.storagePass, cleanPass);
+    if (remember) localStorage.setItem(this.storageRemember, 'true');
+    else localStorage.removeItem(this.storageRemember);
+    this.dispatch('mqtt:credentials-saved', { username: cleanUser, remember: Boolean(remember), status: this.getCredentialStatus() });
+    return this.connect(true);
+  }
+
+  clearCredentials(announce = true) {
+    [localStorage, sessionStorage].forEach(store => {
+      store.removeItem(this.storageUser);
+      store.removeItem(this.storagePass);
+    });
+    localStorage.removeItem(this.storageRemember);
+    this.pendingPublishes = [];
+    this.disconnect();
+    if (announce) this.dispatch('mqtt:credentials-cleared', true);
+  }
+
+  showSetup() {
+    if (window.SmartFarmUI?.openMqttSetup) {
+      window.SmartFarmUI.openMqttSetup();
+      return;
+    }
+    this.dispatch('mqtt:credentials-required', { configured: false, manual: true });
+  }
+
+  disconnect() {
+    this.clearReconnectTimer(true);
+    clearInterval(this.deviceTimer);
+    this.deviceTimer = null;
+    if (this.client) {
+      this.client.end(true);
+      this.client = null;
+    }
+    if (this.worker) {
+      try { this.worker.port.postMessage({ type: 'disconnect' }); } catch (_) { /* noop */ }
+      try { this.worker.port.close(); } catch (_) { /* noop */ }
+      this.worker = null;
+      this.usingSharedWorker = false;
+    }
+    this.connecting = false;
+    APP_STATE.mqttConnected = false;
+    this.dispatch('mqtt:connected', false);
+  }
+
+  setDeviceOnline(online, source = 'mqtt') {
+    APP_STATE.espOnline = Boolean(online);
+    APP_STATE.espStatusSource = source;
+    this.dispatch('esp:status', {
+      online: Boolean(online),
+      source,
+      lastSeen: APP_STATE.espLastSeen
+    });
+  }
+
+  markDeviceSeen(source = 'heartbeat') {
+    APP_STATE.espLastSeen = Date.now();
+    this.setDeviceOnline(true, source);
+  }
+
+  startDeviceWatchdog() {
+    clearInterval(this.deviceTimer);
+    this.deviceTimer = setInterval(() => {
+      const stale = APP_STATE.espLastSeen && Date.now() - APP_STATE.espLastSeen > this.config.deviceHeartbeatTimeoutMs;
+      if (stale) this.setDeviceOnline(false, 'timeout');
+    }, 5000);
+  }
+
+  handleWorkerMessage(message = {}) {
+    if (message.type === 'connect') {
+      this.connecting = false;
+      APP_STATE.mqttConnected = true;
+      this.dispatch('mqtt:connected', true);
+      this.startDeviceWatchdog();
+      this.flushPending();
+      return;
+    }
+    if (message.type === 'close') {
+      APP_STATE.mqttConnected = false;
+      this.connecting = false;
+      this.dispatch('mqtt:connected', false);
+      if (this.hasCredentials()) this.dispatch('mqtt:reconnecting', true);
+      return;
+    }
+    if (message.type === 'connecting') {
+      this.connecting = true;
+      this.dispatch('mqtt:connecting', true);
+      return;
+    }
+    if (message.type === 'reconnect') {
+      this.connecting = true;
+      this.dispatch('mqtt:reconnecting', true);
+      return;
+    }
+    if (message.type === 'reconnect-scheduled') {
+      this.connecting = true;
+      this.dispatch('mqtt:reconnecting', { delay: Number(message.delay) || 0 });
+      return;
+    }
+    if (message.type === 'credentials-required') {
+      this.connecting = false;
+      this.dispatch('mqtt:credentials-required', { configured: false });
+      return;
+    }
+    if (message.type === 'subscribe-error') {
+      this.dispatch('mqtt:subscribe-error', { topic: message.topic, error: new Error(message.error || 'subscribe failed') });
+      return;
+    }
+    if (message.type === 'publish-ack') {
+      this.dispatchCommandStatus('acknowledged', { requestId: message.requestId, topic: message.topic, qos: message.packet?.qos ?? 0 });
+      this.dispatch('mqtt:publish-ack', { requestId: message.requestId, topic: message.topic, packet: message.packet });
+      return;
+    }
+    if (message.type === 'publish-error' || message.type === 'publish-failed') {
+      this.dispatchCommandStatus('error', { requestId: message.requestId, topic: message.topic, error: message.error || 'MQTT publish failed' });
+      this.dispatch('mqtt:publish-error', {
+        requestId: message.requestId,
+        topic: message.topic,
+        error: new Error(message.error || 'MQTT publish failed')
+      });
+      return;
+    }
+    if (message.type === 'message') {
+      this.handleMessage(message.topic, message.payload);
+      return;
+    }
+    if (message.type === 'error') {
+      this.connecting = false;
+      this.lastConnectError = String(message.error || '');
+      this.dispatch('mqtt:error', new Error(this.lastConnectError || 'MQTT worker error'));
+    }
+  }
+
+  connectSharedWorker(force = false) {
+    if (typeof SharedWorker === 'undefined') return false;
+    try {
+      if (!this.worker) {
+        this.worker = new SharedWorker(`mqtt-shared-worker.js?v=1`);
+        this.usingSharedWorker = true;
+        this.worker.port.onmessage = event => this.handleWorkerMessage(event.data || {});
+        this.worker.onerror = error => {
+          this.lastConnectError = String(error?.message || error || 'SharedWorker error');
+          try { this.worker.port.close(); } catch (_) { /* noop */ }
+          this.worker = null;
+          this.usingSharedWorker = false;
+          this.dispatch('mqtt:error', new Error(this.lastConnectError));
+          if (this.hasCredentials()) this.connect();
+        };
+        this.worker.port.start();
+      }
+      const credentials = this.getCredentials();
+      this.worker.port.postMessage({
+        type: 'connect',
+        force,
+        config: {
+          url: this.config.url,
+          clientId: this.config.clientId,
+          allowedSubscribeTopics: [...this.config.allowedSubscribeTopics]
+        },
+        credentials
+      });
+      return true;
+    } catch (error) {
+      this.worker = null;
+      this.usingSharedWorker = false;
+      this.lastConnectError = String(error?.message || error || '');
+      return false;
+    }
+  }
+
+  connect(force = false) {
+    const credentials = this.getCredentials();
+    if (!credentials.username || !credentials.password) {
+      this.dispatch('mqtt:credentials-required', { configured: false, status: this.getCredentialStatus() });
+      return false;
+    }
+    if (!force && (this.client?.connected || this.connecting || this.reconnectTimer || (this.usingSharedWorker && APP_STATE.mqttConnected))) return true;
+    if (force && (this.client || this.worker)) this.disconnect();
+    // Keep the original browser MQTT path as the primary connection method.
+    // SharedWorker remains available as a fallback for browsers without mqtt.js.
+    if (typeof mqtt === 'undefined') {
+      if (this.connectSharedWorker(force)) return true;
+      this.dispatch('mqtt:error', new Error('ไม่พบ MQTT library'));
+      return false;
+    }
+
+    this.connecting = true;
+    this.dispatch('mqtt:connecting', true);
+    try {
+      this.client = mqtt.connect(this.config.url, {
+        clientId: this.config.clientId,
+        username: credentials.username,
+        password: credentials.password,
+        clean: true,
+        // The handler owns reconnect timing so there is only one backoff loop.
+        reconnectPeriod: 0,
+        connectTimeout: 30000,
+        keepalive: 30
+      });
+    } catch (error) {
+      this.connecting = false;
+      this.lastConnectError = String(error?.message || error || '');
+      this.dispatch('mqtt:error', error);
+      this.scheduleReconnect();
+      return false;
+    }
+
+    const nextClient = this.client;
+    this.client.on('connect', () => {
+      if (this.client !== nextClient) return;
+      this.connecting = false;
+      this.clearReconnectTimer(true);
+      APP_STATE.mqttConnected = true;
+      this.dispatch('mqtt:connected', true);
+      this.config.allowedSubscribeTopics.forEach(topic => {
+        nextClient.subscribe(topic, { qos: 0 }, error => {
+          if (error) this.dispatch('mqtt:subscribe-error', { topic, error: new Error(this.errorMessage(error, 'MQTT subscribe failed')) });
+        });
+      });
+      this.startDeviceWatchdog();
+      this.flushPending();
+    });
+    this.client.on('message', (topic, message) => {
+      if (this.client === nextClient) this.handleMessage(topic, message.toString());
+    });
+    this.client.on('close', () => {
+      if (this.client !== nextClient) return;
+      this.client = null;
+      APP_STATE.mqttConnected = false;
+      this.connecting = false;
+      this.dispatch('mqtt:connected', false);
+      this.scheduleReconnect();
+    });
+    this.client.on('reconnect', () => {
+      if (this.client !== nextClient) return;
+      this.connecting = true;
+      this.dispatch('mqtt:reconnecting', true);
+    });
+    this.client.on('error', error => {
+      if (this.client !== nextClient) return;
+      this.connecting = false;
+      this.lastConnectError = String(error?.message || error || '');
+      this.dispatch('mqtt:error', error);
+    });
+    return true;
+  }
+
+  bootstrap() {
+    if (this.bootstrapped) return;
+    this.bootstrapped = true;
+    this.startDeviceWatchdog();
+    if (this.hasCredentials()) this.connect();
+    else this.dispatch('mqtt:credentials-required', { configured: false, initial: true, status: this.getCredentialStatus() });
+  }
+
+  flushPending() {
+    const sharedReady = this.usingSharedWorker && APP_STATE.mqttConnected;
+    if (!sharedReady && !this.client?.connected) return;
+    const now = Date.now();
+    const queue = this.pendingPublishes.splice(0);
+    queue.forEach(item => {
+      if (now - item.createdAt > 30000) return;
+      if (sharedReady) this.worker?.port.postMessage({ type: 'publish', requestId: item.requestId, topic: item.topic, payload: item.payload, options: item.options });
+      else this.publishDirect(item.topic, item.payload, item.options, item.requestId);
+    });
+  }
+
+  publish(topic, payload, options = {}) {
+    if (!topic) return false;
+    const requestId = this.nextPublishId();
+    const publishOptions = this.publishOptions(topic, options);
+    const important = this.isImportantCommand(topic);
+    const connected = this.usingSharedWorker ? APP_STATE.mqttConnected : Boolean(this.client?.connected);
+    if (!connected) {
+      if (!this.hasCredentials()) {
+        this.dispatch('mqtt:credentials-required', { configured: false, forPublish: true });
+        return false;
+      }
+      const isControlCommand = /^(smartfarm\/relay\/|smartfarm\/mode\/set|smartfarm\/schedule\/|smartfarm\/config\/telegram\/|smartfarm\/reminder\/|smartfarm\/ai\/alert\/set)/.test(topic);
+      if (isControlCommand) {
+        this.dispatchCommandStatus('blocked', { requestId, topic, qos: publishOptions.qos, reason: 'not-connected' });
+        this.dispatch('mqtt:command-blocked', { topic, reason: 'not-connected' });
+        this.connect();
+        return false;
+      }
+      this.pendingPublishes.push({ requestId, topic, payload: String(payload), options: publishOptions, createdAt: Date.now() });
+      this.dispatchCommandStatus('queued', { requestId, topic, qos: publishOptions.qos });
+      this.connect();
+      return true;
+    }
+    this.dispatchCommandStatus('pending', { requestId, topic, qos: publishOptions.qos, important });
+    if (this.usingSharedWorker) {
+      this.worker?.port.postMessage({ type: 'publish', requestId, topic, payload: String(payload), options: publishOptions });
+      return true;
+    }
+    return this.publishDirect(topic, String(payload), publishOptions, requestId);
+  }
+
+  handleMessage(topic, payload) {
+    const value = String(payload).trim();
+    if (topic.startsWith('smartfarm/relay/') && topic.endsWith('/timer/status')) {
+      const relay = topic.split('/')[2];
+      if (!RELAYS.includes(relay)) return;
+      try {
+        const timer = JSON.parse(value);
+        const remaining = Math.max(0, Number(timer.remaining) || 0);
+        this.markDeviceSeen('relay-timer-status');
+        const unlimited = Boolean(timer.unlimited) || (Boolean(timer.active) && remaining === 0);
+        this.dispatch('relay:timer', { relay, active: Boolean(timer.active), unlimited, remaining });
+      } catch (_) {
+        this.dispatch('relay:timer', { relay, active: false, remaining: 0 });
+      }
+      return;
+    }
+    if (topic.startsWith('smartfarm/relay/') && topic.endsWith('/status')) {
+      const relay = topic.split('/')[2];
+      const on = value.toUpperCase() === 'ON';
+      if (RELAYS.includes(relay) && ['ON', 'OFF'].includes(value.toUpperCase())) {
+        APP_STATE.relays[relay] = on;
+        this.markDeviceSeen('relay-status');
+        this.dispatch('relay:status', { relay, status: on });
+      }
+      return;
+    }
+    if (topic === this.config.topics.online) {
+      if (['true', 'online', '1', 'yes'].includes(value.toLowerCase())) {
+        this.markDeviceSeen('presence');
+      } else if (!APP_STATE.espLastSeen || Date.now() - APP_STATE.espLastSeen > this.config.deviceHeartbeatTimeoutMs) {
+        this.setDeviceOnline(false, 'last-will');
+      }
+      return;
+    }
+    if (topic === this.config.topics.deviceStatus) {
+      try {
+        const device = JSON.parse(value);
+        if (device.online === false) {
+          if (!APP_STATE.espLastSeen || Date.now() - APP_STATE.espLastSeen > this.config.deviceHeartbeatTimeoutMs) this.setDeviceOnline(false, 'device-status');
+        } else this.markDeviceSeen('device-status');
+        this.dispatch('device:data', device);
+      } catch (_) {
+        this.markDeviceSeen('device-status');
+      }
+      return;
+    }
+    if (topic === this.config.topics.modeStatus) {
+      const mode = value.toUpperCase();
+      if (mode === 'AUTO' || mode === 'MANUAL') {
+        this.markDeviceSeen('mode-status');
+        this.dispatch('mode:status', mode);
+      }
+      return;
+    }
+    if (topic === this.config.topics.time) {
+      try {
+        this.dispatch('time:data', JSON.parse(value));
+      } catch (_) { /* Ignore malformed time packet. */ }
+      return;
+    }
+    if (topic === this.config.topics.error) {
+      try {
+        this.dispatch('system:error', JSON.parse(value));
+      } catch (_) {
+        this.dispatch('system:error', { code: 'INVALID_JSON', message: value });
+      }
+      return;
+    }
+    if (topic === this.config.topics.emergencyStatus) {
+      try {
+        const emergency = JSON.parse(value);
+        APP_STATE.emergencyLock = Boolean(emergency.active);
+        this.markDeviceSeen('emergency-status');
+        this.dispatch('emergency:status', emergency);
+      } catch (_) {
+        this.dispatch('emergency:status', { active: false, source: 'invalid-status' });
+      }
+      return;
+    }
+    if (topic === this.config.topics.telegramStatus) {
+      try {
+        this.dispatch('telegram:status', JSON.parse(value));
+      } catch (_) {
+        this.dispatch('telegram:status', { configured: false });
+      }
+      return;
+    }
+    if (topic.startsWith('smartfarm/schedule/') && topic.endsWith('/status')) {
+      const relay = topic.split('/')[2];
+      if (!RELAYS.includes(relay)) return;
+      try {
+        const schedule = JSON.parse(value);
+        this.markDeviceSeen('schedule-status');
+        this.dispatch('schedule:status', { relay, schedule });
+      } catch (_) {
+        this.dispatch('schedule:error', { relay, message: 'ข้อมูลตารางเวลาจากอุปกรณ์ไม่ถูกต้อง' });
+      }
+      return;
+    }
+    if (topic === this.config.topics.aiAlertStatus) {
+      try {
+        this.dispatch('ai:alert-status', JSON.parse(value));
+      } catch (_) {
+        this.dispatch('ai:alert-status', { status: 'invalid' });
+      }
+      return;
+    }
+    if (topic === this.config.topics.reminderStatus) {
+      try {
+        this.dispatch('reminder:status', JSON.parse(value));
+      } catch (_) {
+        this.dispatch('reminder:error', { message: 'ข้อมูล reminder จากอุปกรณ์ไม่ถูกต้อง' });
+      }
+      return;
+    }
+    if (topic === this.config.topics.sensor('dht11')) {
+      try {
+        const sensor = JSON.parse(value);
+        this.markDeviceSeen('dht11');
+        if (Number.isFinite(Number(sensor.temperature))) this.dispatch('sensor:data', { type: 'temperature', value: Number(sensor.temperature) });
+        if (Number.isFinite(Number(sensor.humidity))) this.dispatch('sensor:data', { type: 'humidity', value: Number(sensor.humidity) });
+      } catch (_) { /* Ignore malformed sensor packet. */ }
+    }
+  }
+}
+
+window.mqttHandler = new MqttHandler(MQTT_CONFIG);
