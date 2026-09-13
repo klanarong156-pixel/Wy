@@ -10,7 +10,7 @@
     $('relays').innerHTML = cfg.relays.map((relay, i) => `<article class="relay"><div><b>รีเลย์ ${i + 1}</b><input data-name="${relay}" value="${names[relay] || relay}" maxlength="40"><small>MQTT: ${relay}</small></div><button data-relay="${relay}" class="off">ปิด</button></article>`).join('');
     document.querySelectorAll('[data-relay]').forEach(btn => btn.onclick = () => publish(topic(`relay/${btn.dataset.relay}/set`), btn.classList.contains('on') ? 'OFF' : 'ON'));
   }
-  function setRelay(relay, on) { const btn = document.querySelector(`[data-relay="${relay}"]`); if (!btn) return; btn.className = on ? 'on' : 'off'; btn.textContent = on ? 'เปิดอยู่' : 'ปิด'; }
+  function setRelay(relay, on) { const btn = document.querySelector(`[data-relay="${relay}"]`); if (!btn) return; btn.className = on ? 'on' : 'off'; btn.textContent = on ? 'เปิดอยู่' : 'ปิด'; const active = document.querySelectorAll('[data-relay].on').length; if ($('activeCount')) $('activeCount').textContent = `${active} / ${cfg.relays.length}`; }
   function publish(t, payload) { if (window.FIREBASE_AUTH_ENABLED && !window.SmartFarmAccess?.can("operator")) return log("ไม่มีสิทธิ์ควบคุมรีเลย์"); if (!client?.connected) return log('ยังไม่ได้เชื่อมต่อ MQTT'); client.publish(t, payload, {qos: 1, retain: false}); log(`ส่ง ${payload} → ${t}`); }
   function connect() {
     const user = $('mqttUser').value.trim(), pass = $('mqttPass').value;
